@@ -1,0 +1,6 @@
+{
+  "name": "Polterheist: Godot 4 Studio & Simulator",
+  "description": "Comprehensive Godot 4 & GDScript architecture guide, interactive 2D stealth physics simulator, Gemini AI game dev co-pilot, and asset generator for Polterheist.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
