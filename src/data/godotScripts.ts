@@ -371,18 +371,20 @@ func _on_body_entered(body: Node) -> void:
     filename: 'guard_ai.gd',
     title: 'Guard AI & Vision Cone System',
     nodeType: 'CharacterBody2D',
-    description: 'Implements Finite State Machine (PATROL, SUSPICIOUS, STUNNED), waypoint traversal, Area2D flashlight vision cone detecting fast objects, and knockout reactions.',
+    description: 'Implements Finite State Machine (PATROL, SUSPICIOUS, STUNNED), unpredictable graph-based patrolling with sudden 180° turns & halts, Area2D flashlight vision cone, and knockout reactions.',
     nodeTree: GODOT_NODE_HIERARCHIES.GuardNPC,
     setupNotes: [
       'Attach this script to GuardNPC (CharacterBody2D). Add GuardNPC to group "Guard".',
       'Create an Area2D child called "VisionCone" with a CollisionPolygon2D shaping the flashlight arc.',
       'Connect Area2D body_entered signal to _on_vision_cone_body_entered.',
-      'Assign Marker2D patrol nodes to the "patrol_points" exported array in the Inspector.'
+      'Assign Marker2D patrol nodes to the "patrol_points" exported array in the Inspector.',
+      'Configure unpredictable sudden turns via exported variables in the Inspector.'
     ],
     code: `extends CharacterBody2D
 class_name GuardAI
 
 enum State { PATROL, SUSPICIOUS, STUNNED }
+enum SubAction { WALKING, PAUSED_SWEEP, TURNING_BACK }
 
 ## Array of Marker2D nodes in the level representing patrol stops
 @export var patrol_points: Array[NodePath] = []
@@ -390,6 +392,11 @@ enum State { PATROL, SUSPICIOUS, STUNNED }
 @export var run_speed: float = 130.0
 @export var vision_velocity_trigger: float = 240.0
 @export var waypoint_arrival_distance: float = 20.0
+
+## Unpredictability settings
+@export var enable_unpredictable_patrol: bool = true
+@export var min_surprise_turn_delay: float = 3.5
+@export var max_surprise_turn_delay: float = 7.0
 
 @onready var vision_cone: Area2D = $VisionCone
 @onready var flashlight: PointLight2D = $FlashlightLight
@@ -399,19 +406,22 @@ enum State { PATROL, SUSPICIOUS, STUNNED }
 @onready var sprite: Sprite2D = $BodySprite
 
 var current_state: State = State.PATROL
+var current_sub_action: SubAction = SubAction.WALKING
+var sub_action_timer: float = 0.0
+var next_unpredictable_timer: float = 4.0
+
 var current_waypoint_index: int = 0
+var previous_waypoint_index: int = 0
 var resolved_patrol_positions: Array[Vector2] = []
 var suspicious_target_position: Vector2 = Vector2.ZERO
 
 func _ready() -> void:
 	add_to_group("Guard")
 	_resolve_patrol_markers()
+	_reset_unpredictable_timer()
 	
-	# Connect Area2D detection
 	if vision_cone:
 		vision_cone.body_entered.connect(_on_vision_cone_body_entered)
-	
-	# Connect state timers
 	if suspicious_timer:
 		suspicious_timer.timeout.connect(_on_suspicious_timeout)
 	if stun_timer:
@@ -438,25 +448,97 @@ func _process_patrol(delta: float) -> void:
 	if resolved_patrol_positions.is_empty():
 		return
 
-	var target := resolved_patrol_positions[current_waypoint_index]
-	var dir := (target - global_position).normalized()
-	velocity = dir * walk_speed
-	
-	# Face movement direction
-	if velocity.length() > 5.0:
-		rotation = lerp_angle(rotation, velocity.angle(), delta * 5.0)
+	# Handle random mid-patrol unpredictable actions (sudden turns / flashlight sweeps)
+	if enable_unpredictable_patrol:
+		next_unpredictable_timer -= delta
+		if next_unpredictable_timer <= 0.0 and current_sub_action == SubAction.WALKING:
+			_trigger_random_unpredictable_maneuver()
 
-	move_and_slide()
+	match current_sub_action:
+		SubAction.PAUSED_SWEEP:
+			# Guard halts and sweeps flashlight left and right
+			velocity = Vector2.ZERO
+			sub_action_timer -= delta
+			rotation += sin(sub_action_timer * 8.0) * (0.05 * delta * 60.0)
+			if sub_action_timer <= 0.0:
+				current_sub_action = SubAction.WALKING
+				_update_state_display()
+			move_and_slide()
 
-	if global_position.distance_to(target) <= waypoint_arrival_distance:
-		current_waypoint_index = (current_waypoint_index + 1) % resolved_patrol_positions.size()
+		SubAction.TURNING_BACK:
+			# Guard rapidly turns 180 degrees toward previous waypoint
+			var target := resolved_patrol_positions[current_waypoint_index]
+			var target_angle := (target - global_position).angle()
+			rotation = lerp_angle(rotation, target_angle, delta * 9.0)
+			sub_action_timer -= delta
+			velocity = Vector2.ZERO
+			if abs(wrapf(target_angle - rotation, -PI, PI)) < 0.15 or sub_action_timer <= 0.0:
+				current_sub_action = SubAction.WALKING
+				_update_state_display()
+			move_and_slide()
+
+		SubAction.WALKING:
+			var target := resolved_patrol_positions[current_waypoint_index]
+			var dir := (target - global_position).normalized()
+			velocity = dir * walk_speed
+			
+			if velocity.length() > 5.0:
+				rotation = lerp_angle(rotation, velocity.angle(), delta * 5.0)
+
+			move_and_slide()
+
+			# Arrived at waypoint: pick next waypoint unpredictably
+			if global_position.distance_to(target) <= waypoint_arrival_distance:
+				_pick_next_waypoint()
+
+func _trigger_random_unpredictable_maneuver() -> void:
+	_reset_unpredictable_timer()
+	var roll := randf()
+
+	if roll < 0.35:
+		# MANEUVER 1: Sudden 180 degree about-turn!
+		var temp := current_waypoint_index
+		current_waypoint_index = previous_waypoint_index
+		previous_waypoint_index = temp
+		current_sub_action = SubAction.TURNING_BACK
+		sub_action_timer = 0.9
+		if state_label:
+			state_label.text = "↺ SUDDEN TURN!"
+	elif roll < 0.70:
+		# MANEUVER 2: Sudden halt and flashlight sweep!
+		current_sub_action = SubAction.PAUSED_SWEEP
+		sub_action_timer = 1.5
+		if state_label:
+			state_label.text = "👀 SCANNING..."
+	else:
+		# MANEUVER 3: Sudden branch to a random non-consecutive waypoint
+		_pick_next_waypoint(true)
+
+func _pick_next_waypoint(force_branch: bool = false) -> void:
+	previous_waypoint_index = current_waypoint_index
+	var total_pts := resolved_patrol_positions.size()
+	if total_pts <= 1:
+		return
+
+	if force_branch or randf() < 0.4:
+		# Choose random branch not equal to current
+		var candidate := randi() % total_pts
+		while candidate == current_waypoint_index:
+			candidate = randi() % total_pts
+		current_waypoint_index = candidate
+	else:
+		# Either advance or reverse order randomly (non-linear!)
+		var step := -1 if randf() < 0.3 else 1
+		current_waypoint_index = posmod(current_waypoint_index + step, total_pts)
+
+func _reset_unpredictable_timer() -> void:
+	next_unpredictable_timer = randf_range(min_surprise_turn_delay, max_surprise_turn_delay)
 
 func _process_suspicious(delta: float) -> void:
-	# Turn directly toward the suspicious point
+	current_sub_action = SubAction.WALKING
 	if suspicious_target_position != Vector2.ZERO:
 		var target_angle := (suspicious_target_position - global_position).angle()
 		rotation = lerp_angle(rotation, target_angle, delta * 8.0)
-	
 	velocity = Vector2.ZERO
 	move_and_slide()
 
@@ -465,7 +547,6 @@ func _check_detected_body(body: Node) -> void:
 		return
 
 	if body is RigidBody2D and body.is_in_group("Possessable"):
-		# If the object is flying fast in the vision cone!
 		if body.linear_velocity.length() >= vision_velocity_trigger:
 			enter_suspicious_state(body.global_position)
 
@@ -474,33 +555,30 @@ func _on_vision_cone_body_entered(body: Node2D) -> void:
 
 func enter_suspicious_state(disturbing_pos: Vector2) -> void:
 	if current_state == State.STUNNED:
-		return # Cannot be suspicious while unconscious
+		return
 
 	current_state = State.SUSPICIOUS
+	current_sub_action = SubAction.WALKING
 	suspicious_target_position = disturbing_pos
 	
-	# Alert GameManager: increase panic meter by 20%
 	if GameManager:
 		GameManager.register_suspicious_event(self)
 
-	# Stay in Suspicious state for 3.0 seconds as specified
 	if suspicious_timer:
 		suspicious_timer.start(3.0)
 	
 	_update_state_display()
 
 func take_physical_impact(source_object: Node, impact_velocity: float) -> void:
-	# Knockout / Stunned by high velocity possessed object
 	current_state = State.STUNNED
+	current_sub_action = SubAction.WALKING
 	velocity = Vector2.ZERO
 	
-	# Stunned for 5.0 seconds as specified
 	if stun_timer:
 		stun_timer.start(5.0)
 	if suspicious_timer:
 		suspicious_timer.stop()
 		
-	# Dim flashlight when knocked down
 	if flashlight:
 		flashlight.energy = 0.2
 
@@ -509,6 +587,7 @@ func take_physical_impact(source_object: Node, impact_velocity: float) -> void:
 func _on_suspicious_timeout() -> void:
 	if current_state == State.SUSPICIOUS:
 		current_state = State.PATROL
+		_reset_unpredictable_timer()
 		_update_state_display()
 
 func _on_stun_timeout() -> void:
@@ -516,6 +595,7 @@ func _on_stun_timeout() -> void:
 		current_state = State.PATROL
 		if flashlight:
 			flashlight.energy = 1.0
+		_reset_unpredictable_timer()
 		_update_state_display()
 
 func _update_state_display() -> void:
@@ -523,8 +603,16 @@ func _update_state_display() -> void:
 		return
 	match current_state:
 		State.PATROL:
-			state_label.text = ""
-			modulate = Color.WHITE
+			match current_sub_action:
+				SubAction.WALKING:
+					state_label.text = ""
+					modulate = Color.WHITE
+				SubAction.PAUSED_SWEEP:
+					state_label.text = "👀 SCANNING..."
+					modulate = Color(1.0, 0.95, 0.4)
+				SubAction.TURNING_BACK:
+					state_label.text = "↺ SUDDEN TURN!"
+					modulate = Color(1.0, 0.6, 0.2)
 		State.SUSPICIOUS:
 			state_label.text = "!? SUSPICIOUS"
 			modulate = Color(1.0, 0.9, 0.3)
@@ -539,7 +627,6 @@ func _resolve_patrol_markers() -> void:
 		if node is Node2D:
 			resolved_patrol_positions.append(node.global_position)
 	if resolved_patrol_positions.is_empty():
-		# Default fallback patrol path around starting position
 		resolved_patrol_positions = [
 			global_position + Vector2(150, 0),
 			global_position + Vector2(150, 150),

@@ -21,11 +21,15 @@ interface Guard {
   x: number;
   y: number;
   angle: number;
-  patrolIndex: number;
+  targetWaypointIndex: number;
+  previousWaypointIndex: number;
   state: 'PATROL' | 'SUSPICIOUS' | 'STUNNED';
   stateTimer: number; // seconds remaining
   alertPos: { x: number; y: number } | null;
   speed: number;
+  subAction: 'WALKING' | 'PAUSED_SWEEP' | 'TURNING_BACK';
+  subActionTimer: number;
+  nextUnpredictableTimer: number;
 }
 
 interface Waypoint {
@@ -115,26 +119,50 @@ export const PlayableSimulation: React.FC = () => {
 
   const objectsRef = useRef<SimulationObject[]>(JSON.parse(JSON.stringify(initialObjects)));
 
-  // Guard patrol waypoints looping through corridors and doorways
+  // Interconnected Waypoint Network across all 3 wings (no rigid single route)
   const waypoints = useRef<Waypoint[]>([
-    { x: 360, y: 280 }, // West Doorway
-    { x: 380, y: 160 }, // Upper Grand Hallway
-    { x: 630, y: 140 }, // Upper Exhibit
-    { x: 670, y: 310 }, // East Archive Doorway
-    { x: 630, y: 500 }, // Lower Exhibit
-    { x: 380, y: 490 }, // Lower Grand Hallway
+    { x: 140, y: 180 }, // 0: West Gallery North
+    { x: 150, y: 480 }, // 1: West Gallery South
+    { x: 360, y: 280 }, // 2: West Threshold (corridor doorway)
+    { x: 380, y: 150 }, // 3: Grand Hall North
+    { x: 500, y: 340 }, // 4: Grand Hall Center
+    { x: 380, y: 500 }, // 5: Grand Hall South
+    { x: 630, y: 140 }, // 6: Central Exhibit North
+    { x: 630, y: 500 }, // 7: Central Exhibit South
+    { x: 670, y: 310 }, // 8: East Threshold (corridor doorway)
+    { x: 860, y: 160 }, // 9: East Vault North
+    { x: 860, y: 480 }, // 10: East Vault South
   ]);
+
+  // Valid non-intersecting pathways between waypoint nodes
+  const waypointConnections: Record<number, number[]> = {
+    0: [1, 2],
+    1: [0, 2],
+    2: [0, 1, 3, 4, 5],
+    3: [2, 4, 6],
+    4: [2, 3, 5, 6, 7, 8],
+    5: [2, 4, 7],
+    6: [3, 4, 8],
+    7: [4, 5, 8],
+    8: [4, 6, 7, 9, 10],
+    9: [8, 10],
+    10: [8, 9],
+  };
 
   const guardRef = useRef<Guard>({
     id: 'guard-1',
     x: 360,
     y: 280,
     angle: 0,
-    patrolIndex: 0,
+    targetWaypointIndex: 4,
+    previousWaypointIndex: 2,
     state: 'PATROL',
     stateTimer: 0,
     alertPos: null,
     speed: 75,
+    subAction: 'WALKING',
+    subActionTimer: 0,
+    nextUnpredictableTimer: 4.5,
   });
 
   // Walls / Obstacles in room (Increased map size: 1000 x 680 with interior walls)
@@ -182,11 +210,15 @@ export const PlayableSimulation: React.FC = () => {
       x: 360,
       y: 280,
       angle: 0,
-      patrolIndex: 0,
+      targetWaypointIndex: 4,
+      previousWaypointIndex: 2,
       state: 'PATROL',
       stateTimer: 0,
       alertPos: null,
       speed: 75,
+      subAction: 'WALKING',
+      subActionTimer: 0,
+      nextUnpredictableTimer: 4.5,
     };
     particles.current = [];
   }, []);
@@ -508,28 +540,93 @@ export const PlayableSimulation: React.FC = () => {
           }
         }
 
-        // GUARD AI UPDATE
+        // GUARD AI UPDATE (Unpredictable Non-Linear Route & Sudden Maneuvers)
         const guard = guardRef.current;
         if (guard.state === 'PATROL') {
-          const target = waypoints.current[guard.patrolIndex];
-          const gdx = target.x - guard.x;
-          const gdy = target.y - guard.y;
-          const gdist = Math.hypot(gdx, gdy);
+          // Check for unpredictable mid-patrol events
+          guard.nextUnpredictableTimer -= dt;
 
-          if (gdist > 10) {
+          if (guard.nextUnpredictableTimer <= 0 && guard.subAction === 'WALKING') {
+            // Pick next random event countdown (3.5 to 7.0 seconds)
+            guard.nextUnpredictableTimer = 3.5 + Math.random() * 3.5;
+            const roll = Math.random();
+
+            if (roll < 0.35) {
+              // MANEUVER 1: SUDDEN 180° REVERSE (Sharp about-face)
+              const temp = guard.targetWaypointIndex;
+              guard.targetWaypointIndex = guard.previousWaypointIndex;
+              guard.previousWaypointIndex = temp;
+              guard.subAction = 'TURNING_BACK';
+              guard.subActionTimer = 0.9;
+              setGuardStatus('↺ Sudden 180° Turn!');
+            } else if (roll < 0.70) {
+              // MANEUVER 2: SUDDEN HALT & FLASHLIGHT SWEEP
+              guard.subAction = 'PAUSED_SWEEP';
+              guard.subActionTimer = 1.5;
+              setGuardStatus('👀 Scanning Area...');
+            } else {
+              // MANEUVER 3: SUDDEN REROUTE TO ADJACENT CORRIDOR
+              const currentConn = waypointConnections[guard.targetWaypointIndex] || [0];
+              const alternatives = currentConn.filter((idx) => idx !== guard.targetWaypointIndex);
+              if (alternatives.length > 0) {
+                guard.previousWaypointIndex = guard.targetWaypointIndex;
+                guard.targetWaypointIndex = alternatives[Math.floor(Math.random() * alternatives.length)];
+                setGuardStatus('🔀 Diverting Route...');
+              }
+            }
+          }
+
+          if (guard.subAction === 'PAUSED_SWEEP') {
+            // Guard stops moving and sweeps flashlight left and right
+            guard.subActionTimer -= dt;
+            guard.angle += Math.sin(guard.subActionTimer * 8.0) * 0.045;
+            if (guard.subActionTimer <= 0) {
+              guard.subAction = 'WALKING';
+              setGuardStatus('Patrolling');
+            }
+          } else {
+            // Normal walking or turning
+            const target = waypoints.current[guard.targetWaypointIndex] || waypoints.current[0];
+            const gdx = target.x - guard.x;
+            const gdy = target.y - guard.y;
+            const gdist = Math.hypot(gdx, gdy);
+
             const targetAngle = Math.atan2(gdy, gdx);
-            // Smooth rotation
             let diff = targetAngle - guard.angle;
             while (diff < -Math.PI) diff += Math.PI * 2;
             while (diff > Math.PI) diff -= Math.PI * 2;
-            guard.angle += diff * Math.min(dt * 5.0, 1.0);
 
-            guard.x += Math.cos(guard.angle) * guard.speed * dt;
-            guard.y += Math.sin(guard.angle) * guard.speed * dt;
-          } else {
-            guard.patrolIndex = (guard.patrolIndex + 1) % waypoints.current.length;
+            if (guard.subAction === 'TURNING_BACK') {
+              // Rotate sharply toward opposite direction
+              guard.angle += diff * Math.min(dt * 9.0, 1.0);
+              guard.subActionTimer -= dt;
+              if (Math.abs(diff) < 0.15 || guard.subActionTimer <= 0) {
+                guard.subAction = 'WALKING';
+                setGuardStatus('Patrolling');
+              }
+            } else {
+              // Standard smooth navigation
+              guard.angle += diff * Math.min(dt * 5.0, 1.0);
+              guard.x += Math.cos(guard.angle) * guard.speed * dt;
+              guard.y += Math.sin(guard.angle) * guard.speed * dt;
+
+              // Arrived at waypoint
+              if (gdist <= 18) {
+                guard.previousWaypointIndex = guard.targetWaypointIndex;
+                const connections = waypointConnections[guard.targetWaypointIndex] || [0];
+
+                // Unpredictable selection: heavily favor forward / branching paths
+                const forwardChoices = connections.filter((idx) => idx !== guard.previousWaypointIndex);
+                if (forwardChoices.length > 0 && Math.random() < 0.8) {
+                  guard.targetWaypointIndex = forwardChoices[Math.floor(Math.random() * forwardChoices.length)];
+                } else {
+                  guard.targetWaypointIndex = connections[Math.floor(Math.random() * connections.length)];
+                }
+              }
+            }
           }
         } else if (guard.state === 'SUSPICIOUS') {
+          guard.subAction = 'WALKING';
           guard.stateTimer -= dt;
           if (guard.alertPos) {
             const adx = guard.alertPos.x - guard.x;
@@ -542,12 +639,15 @@ export const PlayableSimulation: React.FC = () => {
           }
           if (guard.stateTimer <= 0) {
             guard.state = 'PATROL';
+            guard.nextUnpredictableTimer = 3.5;
             setGuardStatus('Patrolling');
           }
         } else if (guard.state === 'STUNNED') {
+          guard.subAction = 'WALKING';
           guard.stateTimer -= dt;
           if (guard.stateTimer <= 0) {
             guard.state = 'PATROL';
+            guard.nextUnpredictableTimer = 3.5;
             setGuardStatus('Patrolling');
           }
         }
@@ -690,17 +790,41 @@ export const PlayableSimulation: React.FC = () => {
         ctx.strokeRect(w.x, w.y, w.w, w.h);
       });
 
-      // Draw Waypoints (if debug mode on)
+      // Draw Waypoints & Navigation Graph (if debug mode on)
       if (showDebug) {
-        ctx.strokeStyle = '#475569';
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        waypoints.current.forEach((wp, idx) => {
-          if (idx === 0) ctx.moveTo(wp.x, wp.y);
-          else ctx.lineTo(wp.x, wp.y);
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+
+        // Draw network connections
+        Object.entries(waypointConnections).forEach(([fromIdxStr, toIndices]) => {
+          const fromIdx = Number(fromIdxStr);
+          const fromWp = waypoints.current[fromIdx];
+          if (!fromWp) return;
+          toIndices.forEach((toIdx) => {
+            if (toIdx > fromIdx) {
+              const toWp = waypoints.current[toIdx];
+              if (toWp) {
+                ctx.beginPath();
+                ctx.moveTo(fromWp.x, fromWp.y);
+                ctx.lineTo(toWp.x, toWp.y);
+                ctx.stroke();
+              }
+            }
+          });
         });
-        ctx.closePath();
-        ctx.stroke();
+
+        // Draw Waypoint nodes and highlight active target
+        waypoints.current.forEach((wp, idx) => {
+          ctx.beginPath();
+          ctx.arc(wp.x, wp.y, idx === guard.targetWaypointIndex ? 6 : 4, 0, Math.PI * 2);
+          if (idx === guard.targetWaypointIndex) {
+            ctx.fillStyle = '#f59e0b'; // Amber for active goal
+          } else {
+            ctx.fillStyle = '#475569';
+          }
+          ctx.fill();
+        });
         ctx.setLineDash([]);
       }
 
@@ -850,6 +974,12 @@ export const PlayableSimulation: React.FC = () => {
       } else if (guard.state === 'STUNNED') {
         ctx.fillStyle = '#93c5fd';
         ctx.fillText('★ STUNNED ★', guard.x, guard.y - 24);
+      } else if (guard.subAction === 'PAUSED_SWEEP') {
+        ctx.fillStyle = '#fde047';
+        ctx.fillText('👀 SCANNING...', guard.x, guard.y - 24);
+      } else if (guard.subAction === 'TURNING_BACK') {
+        ctx.fillStyle = '#f97316';
+        ctx.fillText('↺ SUDDEN TURN!', guard.x, guard.y - 24);
       }
       ctx.restore();
 
