@@ -33,6 +33,48 @@ interface Waypoint {
   y: number;
 }
 
+// Ray-box line of sight occlusion test
+function lineIntersectsWall(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  wall: { x: number; y: number; w: number; h: number }
+): boolean {
+  const minX = Math.min(x1, x2);
+  const maxX = Math.max(x1, x2);
+  const minY = Math.min(y1, y2);
+  const maxY = Math.max(y1, y2);
+
+  if (maxX < wall.x || minX > wall.x + wall.w || maxY < wall.y || minY > wall.y + wall.h) {
+    return false;
+  }
+
+  let t0 = 0.0;
+  let t1 = 1.0;
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+
+  const p = [-dx, dx, -dy, dy];
+  const q = [x1 - wall.x, wall.x + wall.w - x1, y1 - wall.y, wall.y + wall.h - y1];
+
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) {
+      if (q[i] < 0) return false;
+    } else {
+      const t = q[i] / p[i];
+      if (p[i] < 0) {
+        if (t > t1) return false;
+        if (t > t0) t0 = t;
+      } else {
+        if (t < t0) return false;
+        if (t < t1) t1 = t;
+      }
+    }
+  }
+  return t0 <= t1;
+}
+
 export const PlayableSimulation: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -48,36 +90,45 @@ export const PlayableSimulation: React.FC = () => {
 
   // References for continuous 60fps loop without state desync
   const keysPressed = useRef<{ [key: string]: boolean }>({});
-  const mousePos = useRef<{ x: number; y: number }>({ x: 400, y: 300 });
+  const mousePos = useRef<{ x: number; y: number }>({ x: 500, y: 340 });
 
   const ghostPos = useRef<{ x: number; y: number; vx: number; vy: number }>({
-    x: 180,
-    y: 280,
+    x: 120,
+    y: 130,
     vx: 0,
     vy: 0,
   });
 
-  const cameraPos = useRef<{ x: number; y: number }>({ x: 400, y: 300 });
+  const cameraPos = useRef<{ x: number; y: number }>({ x: 500, y: 340 });
 
-  const objectsRef = useRef<SimulationObject[]>([
-    { id: '1', name: 'Ceramic Vase', x: 280, y: 180, vx: 0, vy: 0, radius: 18, mass: 1.0, isPossessed: false, type: 'vase', color: '#6ee7b7' },
-    { id: '2', name: 'Heavy Oak Crate', x: 420, y: 220, vx: 0, vy: 0, radius: 24, mass: 2.5, isPossessed: false, type: 'crate', color: '#d97706' },
-    { id: '3', name: 'Haunted Clock', x: 580, y: 150, vx: 0, vy: 0, radius: 22, mass: 1.8, isPossessed: false, type: 'clock', color: '#c084fc' },
-    { id: '4', name: 'Marble Statue', x: 340, y: 440, vx: 0, vy: 0, radius: 28, mass: 3.2, isPossessed: false, type: 'statue', color: '#94a3b8' },
-    { id: '5', name: 'Relic Urn', x: 620, y: 410, vx: 0, vy: 0, radius: 20, mass: 1.2, isPossessed: false, type: 'vase', color: '#38bdf8' },
-  ]);
+  // Expanded collection of possessable museum props
+  const initialObjects: SimulationObject[] = [
+    { id: '1', name: 'Ceramic Vase', x: 130, y: 190, vx: 0, vy: 0, radius: 18, mass: 1.0, isPossessed: false, type: 'vase', color: '#6ee7b7' },
+    { id: '2', name: 'Heavy Oak Crate', x: 160, y: 480, vx: 0, vy: 0, radius: 24, mass: 2.5, isPossessed: false, type: 'crate', color: '#d97706' },
+    { id: '3', name: 'Haunted Clock', x: 390, y: 130, vx: 0, vy: 0, radius: 22, mass: 1.8, isPossessed: false, type: 'clock', color: '#c084fc' },
+    { id: '4', name: 'Marble Statue', x: 370, y: 520, radius: 28, vx: 0, vy: 0, mass: 3.2, isPossessed: false, type: 'statue', color: '#94a3b8' },
+    { id: '5', name: 'Relic Urn', x: 620, y: 150, vx: 0, vy: 0, radius: 20, mass: 1.2, isPossessed: false, type: 'vase', color: '#38bdf8' },
+    { id: '6', name: 'Suit of Armor', x: 620, y: 480, vx: 0, vy: 0, radius: 26, mass: 3.0, isPossessed: false, type: 'statue', color: '#cbd5e1' },
+    { id: '7', name: 'Treasure Chest', x: 860, y: 140, vx: 0, vy: 0, radius: 24, mass: 2.3, isPossessed: false, type: 'crate', color: '#f59e0b' },
+    { id: '8', name: 'Cursed Bust', x: 870, y: 500, vx: 0, vy: 0, radius: 20, mass: 1.4, isPossessed: false, type: 'vase', color: '#e879f9' },
+  ];
 
+  const objectsRef = useRef<SimulationObject[]>(JSON.parse(JSON.stringify(initialObjects)));
+
+  // Guard patrol waypoints looping through corridors and doorways
   const waypoints = useRef<Waypoint[]>([
-    { x: 300, y: 320 },
-    { x: 650, y: 320 },
-    { x: 650, y: 480 },
-    { x: 300, y: 480 },
+    { x: 360, y: 280 }, // West Doorway
+    { x: 380, y: 160 }, // Upper Grand Hallway
+    { x: 630, y: 140 }, // Upper Exhibit
+    { x: 670, y: 310 }, // East Archive Doorway
+    { x: 630, y: 500 }, // Lower Exhibit
+    { x: 380, y: 490 }, // Lower Grand Hallway
   ]);
 
   const guardRef = useRef<Guard>({
     id: 'guard-1',
-    x: 300,
-    y: 320,
+    x: 360,
+    y: 280,
     angle: 0,
     patrolIndex: 0,
     state: 'PATROL',
@@ -86,16 +137,29 @@ export const PlayableSimulation: React.FC = () => {
     speed: 75,
   });
 
-  // Walls / Obstacles in room
+  // Walls / Obstacles in room (Increased map size: 1000 x 680 with interior walls)
   const walls = useRef<Array<{ x: number; y: number; w: number; h: number }>>([
-    // Outer boundaries
-    { x: 40, y: 40, w: 720, h: 16 },
-    { x: 40, y: 544, w: 720, h: 16 },
-    { x: 40, y: 40, w: 16, h: 520 },
-    { x: 744, y: 40, w: 16, h: 520 },
-    // Interior dividing pillars / walls
-    { x: 220, y: 100, w: 20, h: 120 },
-    { x: 480, y: 360, w: 20, h: 140 },
+    // Outer boundaries (1000x680 canvas, 30px border margin)
+    { x: 30, y: 30, w: 940, h: 18 },  // Top boundary
+    { x: 30, y: 632, w: 940, h: 18 }, // Bottom boundary
+    { x: 30, y: 30, w: 18, h: 620 },  // Left boundary
+    { x: 952, y: 30, w: 18, h: 620 }, // Right boundary
+
+    // Interior dividing walls & pillars (like existing charcoal/slate ones)
+    // 1. West Gallery dividing walls (doorway in middle)
+    { x: 260, y: 48, w: 18, h: 180 },
+    { x: 260, y: 380, w: 18, h: 252 },
+    { x: 80, y: 330, w: 120, h: 18 }, // West gallery corner baffle
+
+    // 2. Central Hall dividing pillars & partitions
+    { x: 480, y: 120, w: 18, h: 160 },
+    { x: 480, y: 390, w: 18, h: 160 },
+    { x: 550, y: 280, w: 140, h: 18 }, // Central display divider
+
+    // 3. East Archive / Vault dividing walls (doorway in middle)
+    { x: 740, y: 48, w: 18, h: 180 },
+    { x: 740, y: 380, w: 18, h: 252 },
+    { x: 830, y: 250, w: 122, h: 18 }, // Vault alcove divider
   ]);
 
   // Particles for ghost trail & momentum launches
@@ -111,18 +175,12 @@ export const PlayableSimulation: React.FC = () => {
     setObjectSpeed(0);
     setGuardStatus('Patrolling');
 
-    ghostPos.current = { x: 180, y: 280, vx: 0, vy: 0 };
-    objectsRef.current = [
-      { id: '1', name: 'Ceramic Vase', x: 280, y: 180, vx: 0, vy: 0, radius: 18, mass: 1.0, isPossessed: false, type: 'vase', color: '#6ee7b7' },
-      { id: '2', name: 'Heavy Oak Crate', x: 420, y: 220, vx: 0, vy: 0, radius: 24, mass: 2.5, isPossessed: false, type: 'crate', color: '#d97706' },
-      { id: '3', name: 'Haunted Clock', x: 580, y: 150, vx: 0, vy: 0, radius: 22, mass: 1.8, isPossessed: false, type: 'clock', color: '#c084fc' },
-      { id: '4', name: 'Marble Statue', x: 340, y: 440, vx: 0, vy: 0, radius: 28, mass: 3.2, isPossessed: false, type: 'statue', color: '#94a3b8' },
-      { id: '5', name: 'Relic Urn', x: 620, y: 410, vx: 0, vy: 0, radius: 20, mass: 1.2, isPossessed: false, type: 'vase', color: '#38bdf8' },
-    ];
+    ghostPos.current = { x: 120, y: 130, vx: 0, vy: 0 };
+    objectsRef.current = JSON.parse(JSON.stringify(initialObjects));
     guardRef.current = {
       id: 'guard-1',
-      x: 300,
-      y: 320,
+      x: 360,
+      y: 280,
       angle: 0,
       patrolIndex: 0,
       state: 'PATROL',
@@ -342,8 +400,8 @@ export const PlayableSimulation: React.FC = () => {
           const ghostSpeed = 220;
           ghostPos.current.vx = inputX * ghostSpeed;
           ghostPos.current.vy = inputY * ghostSpeed;
-          ghostPos.current.x += ghostPos.current.vx * dt;
-          ghostPos.current.y += ghostPos.current.vy * dt;
+          ghostPos.current.x = Math.max(52, Math.min(948, ghostPos.current.x + ghostPos.current.vx * dt));
+          ghostPos.current.y = Math.max(52, Math.min(628, ghostPos.current.y + ghostPos.current.vy * dt));
 
           // Ghost particle trail
           if (Math.random() < 0.4) {
@@ -511,27 +569,32 @@ export const PlayableSimulation: React.FC = () => {
               while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
 
               if (Math.abs(angleDiff) <= visionHalfAngle) {
-                // Object is inside the flashlight cone!
-                const speed = Math.hypot(obj.vx, obj.vy);
-                const HIGH_VELOCITY_TRIGGER = 140; // threshold
+                // Check if wall blocks line of sight
+                const isOccluded = walls.current.some((w) => lineIntersectsWall(guard.x, guard.y, obj.x, obj.y, w));
 
-                if (speed >= HIGH_VELOCITY_TRIGGER && guard.state !== 'SUSPICIOUS') {
-                  // Guard enters Suspicious state for 3 seconds
-                  guard.state = 'SUSPICIOUS';
-                  guard.stateTimer = 3.0;
-                  guard.alertPos = { x: obj.x, y: obj.y };
-                  setGuardStatus('!? SUSPICIOUS (3s)');
-                  sfx.playGuardSuspicious();
+                if (!isOccluded) {
+                  // Object is inside the flashlight cone and visible!
+                  const speed = Math.hypot(obj.vx, obj.vy);
+                  const HIGH_VELOCITY_TRIGGER = 140; // threshold
 
-                  // Increase Panic Meter by 20%
-                  setPanicMeter((prev) => {
-                    const nextVal = Math.min(prev + 20, 100);
-                    if (nextVal >= 100) {
-                      setIsLockdown(true);
-                      sfx.playLockdownAlarm();
-                    }
-                    return nextVal;
-                  });
+                  if (speed >= HIGH_VELOCITY_TRIGGER && guard.state !== 'SUSPICIOUS') {
+                    // Guard enters Suspicious state for 3 seconds
+                    guard.state = 'SUSPICIOUS';
+                    guard.stateTimer = 3.0;
+                    guard.alertPos = { x: obj.x, y: obj.y };
+                    setGuardStatus('!? SUSPICIOUS (3s)');
+                    sfx.playGuardSuspicious();
+
+                    // Increase Panic Meter by 20%
+                    setPanicMeter((prev) => {
+                      const nextVal = Math.min(prev + 20, 100);
+                      if (nextVal >= 100) {
+                        setIsLockdown(true);
+                        sfx.playLockdownAlarm();
+                      }
+                      return nextVal;
+                    });
+                  }
                 }
               }
             }
@@ -595,18 +658,28 @@ export const PlayableSimulation: React.FC = () => {
       // Draw faint floor grid tiles
       ctx.strokeStyle = '#111d42';
       ctx.lineWidth = 1;
-      for (let gx = 40; gx < 744; gx += 40) {
+      for (let gx = 30; gx <= 970; gx += 40) {
         ctx.beginPath();
-        ctx.moveTo(gx, 40);
-        ctx.lineTo(gx, 544);
+        ctx.moveTo(gx, 30);
+        ctx.lineTo(gx, 650);
         ctx.stroke();
       }
-      for (let gy = 40; gy < 544; gy += 40) {
+      for (let gy = 30; gy <= 650; gy += 40) {
         ctx.beginPath();
-        ctx.moveTo(40, gy);
-        ctx.lineTo(744, gy);
+        ctx.moveTo(30, gy);
+        ctx.lineTo(970, gy);
         ctx.stroke();
       }
+
+      // Decorative Room Labels on the floor
+      ctx.save();
+      ctx.font = 'bold 10px monospace';
+      ctx.fillStyle = '#1e293b';
+      ctx.letterSpacing = '2px';
+      ctx.fillText('WEST GALLERY', 90, 60);
+      ctx.fillText('GRAND EXHIBITION HALL', 380, 60);
+      ctx.fillText('EAST ARCHIVES & VAULT', 770, 60);
+      ctx.restore();
 
       // Draw Walls / Geometry
       ctx.fillStyle = '#1e293b';
@@ -927,8 +1000,8 @@ export const PlayableSimulation: React.FC = () => {
       <div className="relative flex-1 bg-[#0a1128] flex items-center justify-center p-2 select-none overflow-hidden">
         <canvas
           ref={canvasRef}
-          width={800}
-          height={600}
+          width={1000}
+          height={680}
           onClick={handleCanvasClick}
           onMouseMove={handleCanvasMouseMove}
           className="rounded-lg shadow-[0_0_35px_rgba(0,0,0,0.8)] border border-cyan-900/30 cursor-crosshair max-w-full max-h-full object-contain"
